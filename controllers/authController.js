@@ -1,163 +1,179 @@
-// ================= IMPORTS =================
+// controllers/authController.js
 import nodemailer from "nodemailer";
-import bcrypt from "bcryptjs";
+import bcrypt from "bcryptjs"; // used only for compare, not hashing before save
 import jwt from "jsonwebtoken";
 import UsersAuth from "../models/UsersAuth.js";
 
-// ================= HELPER =================
+// Helper: simple Nepal local phone validator (97/98)
 function isValidLocalPhone(phone) {
-  return /^(97|98)\d{8}$/.test(phone?.toString().trim());
+  if (!phone) return false;
+  const s = phone.toString().trim();
+  return /^(97|98)\d{8}$/.test(s);
 }
 
-// ================= SEND OTP =================
+// Standard response helper
+function sendError(res, status = 400, message = "Invalid request") {
+  return res.status(status).json({ success: false, message });
+}
+
+// Create transporter once (will read from env)
+function createTransporter() {
+  return nodemailer.createTransport({
+    service: "gmail",
+    auth: {
+      user: process.env.EMAIL_USER,
+      pass: process.env.EMAIL_PASS,
+    },
+  });
+}
+
+// ================= REGISTER / SEND OTP (email) =================
 export const sendOTP = async (req, res) => {
-  const { email, phone, password, confirmPassword } = req.body;
-
-  if (!email || !phone || !password) {
-    return res.status(400).json({ success: false, message: "All fields are required" });
-  }
-
-  if (!isValidLocalPhone(phone)) {
-    return res.status(400).json({ success: false, message: "Invalid phone number" });
-  }
-
-  if (confirmPassword && password !== confirmPassword) {
-    return res.status(400).json({ success: false, message: "Passwords do not match" });
-  }
-
-  const otp = Math.floor(1000 + Math.random() * 9000).toString();
-
   try {
-    let user = await UsersAuth.findOne({ $or: [{ email }, { phone }] });
+    const { email, phone, password, confirmPassword } = req.body;
 
-    const hashedPassword = await bcrypt.hash(password, 10);
+    if (!email || !phone || !password) {
+      return sendError(res, 400, "Email, phone and password are required");
+    }
 
-    if (!user) {
-      // Create new user
+    // basic validations
+    if (!isValidLocalPhone(phone)) {
+      return sendError(res, 400, "Invalid local phone number");
+    }
+
+    if (confirmPassword && password !== confirmPassword) {
+      return sendError(res, 400, "Passwords do not match");
+    }
+
+    // check if user exists
+    let existing = await UsersAuth.findOne({ $or: [{ email }, { phone }] });
+
+    // If already exists and verified -> cannot register
+    if (existing && existing.verified) {
+      return sendError(res, 409, "An account with this email/phone already exists");
+    }
+
+    // Generate 4-digit OTP
+    const otp = Math.floor(1000 + Math.random() * 9000).toString();
+    const otpExpiresAt = Date.now() + 2 * 60 * 1000; // 2 minutes
+
+    // If user exists (but not verified) update fields, otherwise create new doc.
+    let user;
+    if (!existing) {
       user = new UsersAuth({
         email,
         phone,
-        password: hashedPassword,
+        password, // NOTE: UsersAuth schema pre-save will hash this
         otp,
-        otpExpiresAt: Date.now() + 2 * 60 * 1000,
+        otpExpiresAt,
         verified: false,
       });
     } else {
-      // Update existing unverified user
-      user.password = hashedPassword;
-      user.otp = otp;
-      user.otpExpiresAt = Date.now() + 2 * 60 * 1000;
-      user.verified = false;
+      // update existing unverified user
+      existing.email = email;
+      existing.phone = phone;
+      existing.password = password; // UsersAuth pre-save will hash
+      existing.otp = otp;
+      existing.otpExpiresAt = otpExpiresAt;
+      existing.verified = false;
+      user = existing;
     }
 
     await user.save();
 
-    // Send OTP
-    const transporter = nodemailer.createTransport({
-      service: "gmail",
-      auth: { user: process.env.EMAIL_USER, pass: process.env.EMAIL_PASS },
+    // send OTP to email only
+    const transporter = createTransporter();
+
+    // Optionally verify transporter once (silent) — don't throw to client if transporter can't verify
+    transporter.verify().catch((err) => {
+      console.error("Nodemailer verify failed:", err && err.message);
     });
 
-    await transporter.sendMail({
+    const mailOptions = {
       from: process.env.EMAIL_USER,
       to: email,
       subject: "Your Yugma OTP",
-      text: `Your OTP is ${otp}. Valid for 2 minutes.`,
-    });
+      text: `Your OTP is ${otp}. It is valid for 2 minutes.`,
+    };
 
-    res.json({ success: true, message: "OTP sent successfully" });
+    await transporter.sendMail(mailOptions);
 
+    return res.json({ success: true, message: "OTP sent to email" });
   } catch (err) {
-    console.error("Error sending OTP:", err);
-    res.status(500).json({ success: false, message: "Failed to send OTP" });
+    console.error("sendOTP error:", err);
+    return sendError(res, 500, "Failed to send OTP");
   }
 };
 
 // ================= VERIFY OTP =================
 export const verifyOTP = async (req, res) => {
-  const { email, otp } = req.body;
-
-  if (!email || !otp) {
-    return res.status(400).json({ success: false, message: "Email and OTP required" });
-  }
-
   try {
+    const { email, otp } = req.body;
+    if (!email || !otp) return sendError(res, 400, "Email and OTP are required");
+
     const user = await UsersAuth.findOne({ email });
+    if (!user) return sendError(res, 404, "User not found");
 
-    if (!user) {
-      return res.status(404).json({ success: false, message: "User not found" });
-    }
-
-    if (!user.otp || Date.now() > user.otpExpiresAt) {
+    // Check expiry
+    if (!user.otp || !user.otpExpiresAt || Date.now() > new Date(user.otpExpiresAt).getTime()) {
       user.otp = null;
       user.otpExpiresAt = null;
-      await user.save();
-      return res.status(400).json({ success: false, message: "OTP expired" });
+      await user.save().catch(() => {});
+      return sendError(res, 400, "OTP expired");
     }
 
     if (user.otp !== otp.toString().trim()) {
-      return res.status(400).json({ success: false, message: "Invalid OTP" });
+      return sendError(res, 400, "Invalid OTP");
     }
 
-    // Mark user as verified
+    // Mark verified and clear OTP
     user.verified = true;
     user.otp = null;
     user.otpExpiresAt = null;
     await user.save();
 
+    // issue JWT
     const token = jwt.sign({ id: user._id }, process.env.JWT_SECRET, { expiresIn: "7d" });
 
-    res.json({
+    return res.json({
       success: true,
       message: "OTP verified",
       token,
-      user: {
-        id: user._id,
-        email: user.email,
-        phone: user.phone,
-      },
+      user: { id: user._id, email: user.email, phone: user.phone },
     });
   } catch (err) {
-    console.error("Error verifying OTP:", err);
-    res.status(500).json({ success: false, message: "Failed to verify OTP" });
+    console.error("verifyOTP error:", err);
+    return sendError(res, 500, "Failed to verify OTP");
   }
 };
 
 // ================= LOGIN =================
 export const loginUser = async (req, res) => {
-  const { email, phone, password } = req.body;
-
-  if ((!email && !phone) || !password) {
-    return res.status(400).json({ success: false, message: "Email/Phone and password required" });
-  }
-
   try {
-    const user = email
-      ? await UsersAuth.findOne({ email })
-      : await UsersAuth.findOne({ phone });
+    const { email, phone, password } = req.body;
+    if ((!email && !phone) || !password) {
+      return sendError(res, 400, "Email/Phone and password are required");
+    }
 
-    if (!user) return res.status(404).json({ success: false, message: "User not found" });
-    if (!user.verified) return res.status(400).json({ success: false, message: "Verify your account first" });
+    const query = email ? { email } : { phone };
+    const user = await UsersAuth.findOne(query);
+
+    if (!user) return sendError(res, 404, "User not found");
+    if (!user.verified) return sendError(res, 403, "Please verify your account first");
 
     const passwordMatch = await bcrypt.compare(password, user.password);
-    if (!passwordMatch)
-      return res.status(400).json({ success: false, message: "Invalid credentials" });
+    if (!passwordMatch) return sendError(res, 401, "Invalid credentials");
 
     const token = jwt.sign({ id: user._id }, process.env.JWT_SECRET, { expiresIn: "7d" });
 
-    res.json({
+    return res.json({
       success: true,
       message: "Login successful",
       token,
-      user: {
-        id: user._id,
-        email: user.email,
-        phone: user.phone,
-      },
+      user: { id: user._id, email: user.email, phone: user.phone },
     });
-
   } catch (err) {
-    console.error("Login error:", err);
-    res.status(500).json({ success: false, message: "Server error" });
+    console.error("loginUser error:", err);
+    return sendError(res, 500, "Server error");
   }
 };
