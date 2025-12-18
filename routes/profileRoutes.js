@@ -11,7 +11,20 @@ import {
 import { protect } from "../middlewares/authMiddleware.js";
 
 const router = express.Router();
-const upload = multer({ dest: "uploads/" }); // temp folder
+
+/**
+ * Multer configuration
+ * - memoryStorage prevents files from being written to disk
+ * - files live in req.files[].buffer
+ */
+const storage = multer.memoryStorage();
+
+const upload = multer({
+  storage,
+  limits: {
+    fileSize: 5 * 1024 * 1024, // 5MB per file
+  },
+});
 
 router.use(protect);
 
@@ -19,7 +32,11 @@ router.post("/basic", updateBasicProfile);
 router.post("/gender", updateGenderPreference);
 router.post("/detailed", updateDetailedProfile);
 
-// Use multer for photo upload
+/**
+ * Photo upload (Cloudinary)
+ * field name: "photos"
+ * max files: 5
+ */
 router.post("/photos", upload.array("photos", 5), uploadPhotos);
 
 router.get("/me", getUserProfile);

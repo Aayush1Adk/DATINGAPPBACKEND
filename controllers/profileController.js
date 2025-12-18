@@ -210,86 +210,141 @@ export const updateDetailedProfile = async (req, res) => {
 // ---------------------- UPLOAD PHOTOS ----------------------
 export const uploadPhotos = async (req, res) => {
   const userId = req.user._id;
-  let files = req.files || [];
+  const files = req.files || [];
   const base64Photos = Array.isArray(req.body.photos) ? req.body.photos : [];
 
   try {
     const totalIncoming = files.length + base64Photos.length;
-    if (totalIncoming === 0) return res.status(400).json({ success: false, message: "At least one photo is required" });
-    if (totalIncoming > MAX_PHOTOS) {
-      await Promise.all(files.map(f => removeLocalFile(f.path)));
-      return res.status(400).json({ success: false, message: `Maximum ${MAX_PHOTOS} photos allowed` });
+
+    if (totalIncoming === 0) {
+      return res.status(400).json({
+        success: false,
+        message: "At least one photo is required",
+      });
     }
 
-    for (const f of files) if (!isImageMime(f.mimetype)) return res.status(400).json({ success: false, message: "Only image files allowed" });
+    if (totalIncoming > MAX_PHOTOS) {
+      return res.status(400).json({
+        success: false,
+        message: `Maximum ${MAX_PHOTOS} photos allowed`,
+      });
+    }
+
+    for (const f of files) {
+      if (!isImageMime(f.mimetype)) {
+        return res.status(400).json({
+          success: false,
+          message: "Only image files are allowed",
+        });
+      }
+    }
 
     const uploaded = [];
-    const uploadedIds = [];
 
-    const uploadSingle = async (src) => {
-      const result = await cloudinary.uploader.upload(src, {
-        folder: "yugma/profiles",
-        resource_type: "image",
-        transformation: [{ width: 1200, height: 1200, crop: "limit" }, { quality: "auto:good" }],
+    const uploadFromBuffer = (buffer) => {
+      return new Promise((resolve, reject) => {
+        const stream = cloudinary.uploader.upload_stream(
+          {
+            folder: "yugma/profiles",
+            resource_type: "image",
+            transformation: [
+              { width: 1200, height: 1200, crop: "limit" },
+              { quality: "auto:good" },
+            ],
+          },
+          (error, result) => {
+            if (error) return reject(error);
+            resolve(result);
+          }
+        );
+
+        stream.end(buffer);
       });
-      uploaded.push({ url: result.secure_url, publicId: result.public_id });
-      uploadedIds.push(result.public_id);
     };
 
-    // Upload local files and immediately remove temp
+    // Upload files from memory (multer)
     for (const f of files) {
-      try { await uploadSingle(f.path); } catch (e) { console.error("Cloud upload file error:", e); }
-      finally { await removeLocalFile(f.path); }
+      try {
+        const result = await uploadFromBuffer(f.buffer);
+        uploaded.push({
+          url: result.secure_url,
+          publicId: result.public_id,
+        });
+      } catch (err) {
+        console.error("Cloudinary buffer upload failed:", err);
+      }
     }
 
-    // Upload base64 items
+    // Upload base64 photos (if any)
     for (const b64 of base64Photos) {
-      try { await uploadSingle(b64); } catch (e) { console.error("Cloud upload base64 error:", e); }
+      try {
+        const result = await cloudinary.uploader.upload(b64, {
+          folder: "yugma/profiles",
+          resource_type: "image",
+          transformation: [
+            { width: 1200, height: 1200, crop: "limit" },
+            { quality: "auto:good" },
+          ],
+        });
+
+        uploaded.push({
+          url: result.secure_url,
+          publicId: result.public_id,
+        });
+      } catch (err) {
+        console.error("Cloudinary base64 upload failed:", err);
+      }
     }
 
     if (uploaded.length === 0) {
-      // nothing uploaded
-      return res.status(500).json({ success: false, message: "Failed to upload any photos" });
+      return res.status(500).json({
+        success: false,
+        message: "Failed to upload any photos",
+      });
     }
 
-    // delete old cloudinary images (best-effort) and DB docs
+    // Remove old photos (best-effort)
     const existingPhotos = await UserPhoto.find({ userId }).lean();
     for (const p of existingPhotos) {
       if (p.publicId) {
-        try { await cloudinary.uploader.destroy(p.publicId); } catch (e) { console.error("Failed to destroy old image:", p.publicId, e); }
+        cloudinary.uploader.destroy(p.publicId).catch(() => {});
       }
     }
+
     await UserPhoto.deleteMany({ userId });
 
-    // Insert new photos in DB
-    const docs = uploaded.map((p, i) => ({ userId, url: p.url, publicId: p.publicId, order: i }));
+    // Save new photos
+    const docs = uploaded.map((p, i) => ({
+      userId,
+      url: p.url,
+      publicId: p.publicId,
+      order: i,
+    }));
+
     await UserPhoto.insertMany(docs);
 
-    // Mark profile complete only if at least one photo exists
+    // Update profile status
     let profile = await UserProfile.findOne({ userId });
     if (!profile) profile = new UserProfile({ userId });
+
     profile.profileComplete = true;
     profile.profileStep = Math.max(profile.profileStep || 1, 4);
     await profile.save();
 
-    return res.json({ success: true, message: `${uploaded.length} photo(s) uploaded`, photos: uploaded.map(p => p.url) });
+    return res.json({
+      success: true,
+      message: `${uploaded.length} photo(s) uploaded`,
+      photos: uploaded.map((p) => p.url),
+    });
   } catch (err) {
     console.error("uploadPhotos error:", err);
-
-    // attempt best-effort cleanup of any uploaded images on failure
-    // (we only have publicIds in 'uploaded' if any succeeded)
-    try {
-      const ids = (err && err.uploadedIds) || [];
-      for (const id of ids) {
-        await cloudinary.uploader.destroy(id).catch(() => {});
-      }
-    } catch (er) {
-      console.error("rollback cleanup failed:", er);
-    }
-
-    return res.status(500).json({ success: false, message: "Failed to upload photos" });
+    return res.status(500).json({
+      success: false,
+      message: "Failed to upload photos",
+    });
   }
 };
+
 
 // ---------------------- GET USER PROFILE ----------------------
 export const getUserProfile = async (req, res) => {
@@ -344,7 +399,7 @@ export const getUserProfile = async (req, res) => {
 */
 export const getDiscoverProfiles = async (req, res) => {
   try {
-    const currentUserId = mongoose.Types.ObjectId(req.user._id);
+    const currentUserId = req.user._id;
     const page = Math.max(parseInt(req.query.page) || 1, 1);
     const limit = Math.min(parseInt(req.query.limit) || 20, 50);
     const skip = (page - 1) * limit;
