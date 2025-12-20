@@ -7,4 +7,7 @@ const SwipeSchema = new mongoose.Schema({
   createdAt: { type: Date, default: Date.now }
 });
 
+
+
+
 export default mongoose.model("Swipe", SwipeSchema, "Swipe");

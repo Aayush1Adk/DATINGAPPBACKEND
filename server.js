@@ -1,9 +1,15 @@
 import express from "express";
 import dotenv from "dotenv";
+import http from "http";
+import { Server } from "socket.io";
 import connectDB from "./config/db.js";
 import authRoutes from "./routes/authRoutes.js";
 import profileRoutes from "./routes/profileRoutes.js";
+import messageRoutes from "./routes/messageRoutes.js"; // NEW
 import cors from "cors";
+import registerSockets from "./sockets/index.js";
+import { socketAuthMiddleware } from "./middlewares/socketAuthMiddleware.js";
+
 
 dotenv.config();
 connectDB();
@@ -21,7 +27,27 @@ console.log("PORT:", process.env.PORT || "5000 (default)");
 
 // Routes
 app.use("/api/auth", authRoutes);
-app.use("/api/profile", profileRoutes); // ✅ NEW: Profile routes
+app.use("/api/profile", profileRoutes);
+app.use("/api/messages", messageRoutes); // NEW
+
+
+const server = http.createServer(app);
+
+const io = new Server(server, {
+  cors: { 
+    origin: "*",
+    methods: ["GET", "POST"]
+  }
+});
+
+// Socket authentication middleware
+io.use(socketAuthMiddleware);
+
+// Register socket handlers
+registerSockets(io);
 
 const PORT = process.env.PORT || 5000;
-app.listen(PORT, () => console.log(`✅ Server running on port ${PORT}`));
+server.listen(PORT, () => {
+  console.log(`✅ Server running on port ${PORT}`);
+  console.log(`✅ Socket.IO server ready`);
+});
