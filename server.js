@@ -9,7 +9,8 @@ import messageRoutes from "./routes/messageRoutes.js"; // NEW
 import cors from "cors";
 import registerSockets from "./sockets/index.js";
 import { socketAuthMiddleware } from "./middlewares/socketAuthMiddleware.js";
-
+import likeRoutes from './routes/likeRoutes.js'; //NEW
+import matchRoutes from './routes/matchRoutes.js';
 
 dotenv.config();
 connectDB();
@@ -29,7 +30,8 @@ console.log("PORT:", process.env.PORT || "5000 (default)");
 app.use("/api/auth", authRoutes);
 app.use("/api/profile", profileRoutes);
 app.use("/api/messages", messageRoutes); // NEW
-
+app.use('/api/likes', likeRoutes);//NEW
+app.use('/api/matches', matchRoutes);
 
 const server = http.createServer(app);
 
